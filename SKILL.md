@@ -40,6 +40,7 @@ All secrets must be set as environment variables. **Never hardcode secrets.**
 | `FEISHU_APP_SECRET` | Feishu app secret | Feishu Open Platform |
 | `FEISHU_RECEIVER` | Recipient's open_id | Feishu API |
 | `ARK_API_KEY` | Volcengine Ark API key | [Volcengine Console](https://console.volcengine.com/) |
+| `ARK_ENDPOINT` | Ark API endpoint URL | Provider's API docs |
 | `BITABLE_APP_TOKEN` | Feishu Bitable app token | Create a Bitable, get from URL |
 | `BITABLE_TABLE_ID` | Feishu Bitable table ID | Create a table, get from URL |
 

@@ -17,7 +17,10 @@ if not ARK_API_KEY:
 
 TRANSLATE_MODEL = os.environ.get("TRANSLATE_MODEL", "doubao-seed-2-0-mini-260215")
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "doubao-seed-2-0-mini-260215")
-ARK_ENDPOINT = os.environ.get("ARK_ENDPOINT", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
+ARK_ENDPOINT = os.environ.get("ARK_ENDPOINT")
+if not ARK_ENDPOINT:
+    print("错误: 请设置 ARK_ENDPOINT 环境变量（例如: https://your-provider/api/v3/chat/completions）", file=sys.stderr)
+    sys.exit(1)
 
 def log(msg):
     print(f"[process] {msg}", file=sys.stderr)
