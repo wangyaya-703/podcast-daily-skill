@@ -32,64 +32,82 @@ VOLC_ASR_SCRIPT="$SCRIPT_DIR/volc-asr.sh"
 export VOLC_APPID="${VOLC_APPID:-}"
 export VOLC_TOKEN="${VOLC_TOKEN:-}"
 
-# ── 播客订阅列表 ─────────────────────────────────────────
-PODCAST_KEYS=(
-  "LexFridman"
-  "LinuxUnplugged"
-  "AllIn"
-  "Dwarkesh"
-  "LatentSpace"
-  "HardFork"
-  "KnowledgeProject"
-  "Lenny"
-  "NoPriors"
-  "JoeRogan"
-  "TWIML"
-)
-PODCAST_URLS=(
-  "https://lexfridman.com/feed/podcast/"
-  "https://feeds.fireside.fm/linuxunplugged/rss"
-  "https://allin.libsyn.com/rss"
-  "https://www.dwarkeshpatel.com/feed/podcast"
-  "https://feeds.transistor.fm/latent-space-the-ai-engineer-podcast"
-  "https://feeds.simplecast.com/l2i9YnTd"
-  "https://feeds.simplecast.com/gvtxUiIf"
-  "https://api.substack.com/feed/podcast/10845.rss"
-  "https://feeds.megaphone.fm/nopriors"
-  "https://feeds.megaphone.fm/GLT1412515089"
-  "https://twimlai.com/feed/"
-)
-PODCAST_DISPLAY=(
-  "Lex Fridman Podcast"
-  "Linux Unplugged"
-  "All-In Podcast"
-  "Dwarkesh Podcast"
-  "Latent Space"
-  "Hard Fork (NYT)"
-  "The Knowledge Project"
-  "Lenny's Podcast"
-  "No Priors"
-  "The Joe Rogan Experience"
-  "TWIML AI Podcast"
-)
-# 时间窗口（小时）：JRE 发集频繁用 72h，其余 168h（7天）
-PODCAST_HOURS=(
-  168 168 168 168 168 168 168 168 168 72 168
-)
-# YouTube 频道 URL（用于搜索最新一期抓字幕，空字符串表示无 YouTube）
-PODCAST_YOUTUBE=(
-  "https://www.youtube.com/@lexfridman"
-  ""
-  ""
-  "https://www.youtube.com/@DwarkeshPatel"
-  ""
-  ""
-  ""
-  "https://www.youtube.com/@LennysPodcast"
-  "https://www.youtube.com/@NoPriorsPodcast"
-  "https://www.youtube.com/@joerogan"
-  "https://www.youtube.com/@twimlai"
-)
+# ── 播客订阅列表（支持自定义配置文件）─────────────────────
+# 优先级：PODCAST_CONFIG 环境变量 > 工作目录/podcasts.json > 内置默认
+PODCAST_CONFIG="${PODCAST_CONFIG:-}"
+PODCAST_CONFIG_FILE=""
+if [[ -n "$PODCAST_CONFIG" && -f "$PODCAST_CONFIG" ]]; then
+  PODCAST_CONFIG_FILE="$PODCAST_CONFIG"
+elif [[ -f "$WORKSPACE_DIR/podcasts.json" ]]; then
+  PODCAST_CONFIG_FILE="$WORKSPACE_DIR/podcasts.json"
+fi
+
+if [[ -n "$PODCAST_CONFIG_FILE" ]]; then
+  # 从 JSON 配置文件加载（用 python3 解析，兼容 bash 3.2）
+  log "加载播客配置: $PODCAST_CONFIG_FILE"
+  _PODCAST_DATA=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+for p in cfg.get('podcasts', []):
+    # TAB 分隔各字段，每行一个播客
+    print('\t'.join([
+        p.get('key', ''),
+        p.get('name', ''),
+        p.get('rss', ''),
+        str(p.get('hours', 168)),
+        p.get('youtube', '')
+    ]))
+" "$PODCAST_CONFIG_FILE" 2>>"$LOG_FILE")
+
+  PODCAST_KEYS=()
+  PODCAST_URLS=()
+  PODCAST_DISPLAY=()
+  PODCAST_HOURS=()
+  PODCAST_YOUTUBE=()
+  while IFS=$'\t' read -r _key _name _rss _hours _yt; do
+    [[ -z "$_key" ]] && continue
+    PODCAST_KEYS+=("$_key")
+    PODCAST_DISPLAY+=("$_name")
+    PODCAST_URLS+=("$_rss")
+    PODCAST_HOURS+=("${_hours:-168}")
+    PODCAST_YOUTUBE+=("${_yt:-}")
+  done <<< "$_PODCAST_DATA"
+  log "已加载 ${#PODCAST_KEYS[@]} 个播客"
+else
+  # 内置默认列表
+  PODCAST_KEYS=(
+    "LexFridman" "LinuxUnplugged" "AllIn" "Dwarkesh" "LatentSpace"
+    "HardFork" "KnowledgeProject" "Lenny" "NoPriors" "JoeRogan" "TWIML"
+  )
+  PODCAST_URLS=(
+    "https://lexfridman.com/feed/podcast/"
+    "https://feeds.fireside.fm/linuxunplugged/rss"
+    "https://allin.libsyn.com/rss"
+    "https://www.dwarkeshpatel.com/feed/podcast"
+    "https://feeds.transistor.fm/latent-space-the-ai-engineer-podcast"
+    "https://feeds.simplecast.com/l2i9YnTd"
+    "https://feeds.simplecast.com/gvtxUiIf"
+    "https://api.substack.com/feed/podcast/10845.rss"
+    "https://feeds.megaphone.fm/nopriors"
+    "https://feeds.megaphone.fm/GLT1412515089"
+    "https://twimlai.com/feed/"
+  )
+  PODCAST_DISPLAY=(
+    "Lex Fridman Podcast" "Linux Unplugged" "All-In Podcast" "Dwarkesh Podcast"
+    "Latent Space" "Hard Fork (NYT)" "The Knowledge Project" "Lenny's Podcast"
+    "No Priors" "The Joe Rogan Experience" "TWIML AI Podcast"
+  )
+  PODCAST_HOURS=(168 168 168 168 168 168 168 168 168 72 168)
+  PODCAST_YOUTUBE=(
+    "https://www.youtube.com/@lexfridman" "" ""
+    "https://www.youtube.com/@DwarkeshPatel" "" "" ""
+    "https://www.youtube.com/@LennysPodcast"
+    "https://www.youtube.com/@NoPriorsPodcast"
+    "https://www.youtube.com/@joerogan"
+    "https://www.youtube.com/@twimlai"
+  )
+fi
 
 # ── log 写 stderr，不污染 stdout ──────────────────────────
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG_FILE" >&2; }

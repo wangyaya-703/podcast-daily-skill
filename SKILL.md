@@ -130,12 +130,38 @@ bash scripts/podcast-daily.sh --test
 
 ## Customizing Podcast Subscriptions
 
-Edit the arrays at the top of `podcast-daily.sh`:
-- `PODCAST_KEYS` — Internal keys (no spaces)
-- `PODCAST_URLS` — RSS feed URLs
-- `PODCAST_DISPLAY` — Display names
-- `PODCAST_HOURS` — Time window per feed (hours)
-- `PODCAST_YOUTUBE` — YouTube channel URLs (empty string if none)
+Copy `podcasts.example.json` to your workspace as `podcasts.json` and edit it:
+
+```bash
+cp podcasts.example.json ~/podcast-workflow/podcasts.json
+```
+
+Each podcast entry has these fields:
+
+```json
+{
+  "key": "MyPodcast",
+  "name": "My Favorite Podcast",
+  "rss": "https://example.com/feed/rss",
+  "hours": 168,
+  "youtube": "https://www.youtube.com/@mypodcast"
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `key` | Yes | Internal identifier (no spaces, used for cache file names) |
+| `name` | Yes | Display name shown in digest messages |
+| `rss` | Yes | RSS feed URL |
+| `hours` | No | Time window in hours (default: 168 = 7 days) |
+| `youtube` | No | YouTube channel URL for free subtitle extraction |
+
+**Config file lookup order:**
+1. `PODCAST_CONFIG` environment variable (absolute path)
+2. `podcasts.json` in the workspace directory
+3. Built-in default list (11 podcasts)
+
+To add a podcast, just append an entry to the `podcasts` array. To remove one, delete its entry. No code changes needed.
 
 ## How the AI Processing Works
 

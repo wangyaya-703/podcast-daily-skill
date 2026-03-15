@@ -1,0 +1,81 @@
+{
+  "podcasts": [
+    {
+      "key": "LexFridman",
+      "name": "Lex Fridman Podcast",
+      "rss": "https://lexfridman.com/feed/podcast/",
+      "hours": 168,
+      "youtube": "https://www.youtube.com/@lexfridman"
+    },
+    {
+      "key": "LinuxUnplugged",
+      "name": "Linux Unplugged",
+      "rss": "https://feeds.fireside.fm/linuxunplugged/rss",
+      "hours": 168,
+      "youtube": ""
+    },
+    {
+      "key": "AllIn",
+      "name": "All-In Podcast",
+      "rss": "https://allin.libsyn.com/rss",
+      "hours": 168,
+      "youtube": ""
+    },
+    {
+      "key": "Dwarkesh",
+      "name": "Dwarkesh Podcast",
+      "rss": "https://www.dwarkeshpatel.com/feed/podcast",
+      "hours": 168,
+      "youtube": "https://www.youtube.com/@DwarkeshPatel"
+    },
+    {
+      "key": "LatentSpace",
+      "name": "Latent Space",
+      "rss": "https://feeds.transistor.fm/latent-space-the-ai-engineer-podcast",
+      "hours": 168,
+      "youtube": ""
+    },
+    {
+      "key": "HardFork",
+      "name": "Hard Fork (NYT)",
+      "rss": "https://feeds.simplecast.com/l2i9YnTd",
+      "hours": 168,
+      "youtube": ""
+    },
+    {
+      "key": "KnowledgeProject",
+      "name": "The Knowledge Project",
+      "rss": "https://feeds.simplecast.com/gvtxUiIf",
+      "hours": 168,
+      "youtube": ""
+    },
+    {
+      "key": "Lenny",
+      "name": "Lenny's Podcast",
+      "rss": "https://api.substack.com/feed/podcast/10845.rss",
+      "hours": 168,
+      "youtube": "https://www.youtube.com/@LennysPodcast"
+    },
+    {
+      "key": "NoPriors",
+      "name": "No Priors",
+      "rss": "https://feeds.megaphone.fm/nopriors",
+      "hours": 168,
+      "youtube": "https://www.youtube.com/@NoPriorsPodcast"
+    },
+    {
+      "key": "JoeRogan",
+      "name": "The Joe Rogan Experience",
+      "rss": "https://feeds.megaphone.fm/GLT1412515089",
+      "hours": 72,
+      "youtube": "https://www.youtube.com/@joerogan"
+    },
+    {
+      "key": "TWIML",
+      "name": "TWIML AI Podcast",
+      "rss": "https://twimlai.com/feed/",
+      "hours": 168,
+      "youtube": "https://www.youtube.com/@twimlai"
+    }
+  ]
+}
