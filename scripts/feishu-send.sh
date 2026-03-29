@@ -1,440 +1,619 @@
 #!/usr/bin/env bash
-# feishu-send.sh — 用飞书应用发送播客日报（含飞书文档存档 + 多维表格写入）
-# 用法: bash feishu-send.sh <daily_message_dir>
+# feishu-send.sh — 从 feed-podcasts.json 推送飞书卡片 + 创建飞书文档 + 写入多维表格
 #
-# 必需环境变量: FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_RECEIVER
-# 可选环境变量: BITABLE_APP_TOKEN, BITABLE_TABLE_ID
+# 用法:
+#   bash scripts/feishu-send.sh
+#   bash scripts/feishu-send.sh --feed ./feed-podcasts.json
+#   bash scripts/feishu-send.sh --feed https://raw.githubusercontent.com/.../feed-podcasts.json
+#   bash scripts/feishu-send.sh --feed ... --state ./.feishu-push-state.json --raw-base-url https://raw.githubusercontent.com/<repo>/main
+#
+# 必需环境变量:
+#   FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_RECEIVER
+# 可选环境变量:
+#   BITABLE_APP_TOKEN, BITABLE_TABLE_ID
 
 set -euo pipefail
 
-CACHE_DIR="${1:-}"
-if [[ -z "$CACHE_DIR" || ! -d "$CACHE_DIR" ]]; then
-  echo "用法: feishu-send.sh <日期缓存目录>" >&2
-  exit 1
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# 从环境变量读取（不允许硬编码）
+FEED_SOURCE="${FEED_SOURCE:-$ROOT_DIR/feed-podcasts.json}"
+STATE_PATH="${PUSH_STATE_FILE:-$ROOT_DIR/.feishu-push-state.json}"
+RAW_BASE_URL="${RAW_BASE_URL:-}"
+TRACKING_URL="${TRACKING_URL:-https://bytedance.larkoffice.com/base/QV53bJjHkay63psk2HGc3LuRnrN}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --feed)
+      FEED_SOURCE="$2"
+      shift 2
+      ;;
+    --state)
+      STATE_PATH="$2"
+      shift 2
+      ;;
+    --raw-base-url)
+      RAW_BASE_URL="$2"
+      shift 2
+      ;;
+    --tracking-url)
+      TRACKING_URL="$2"
+      shift 2
+      ;;
+    *)
+      echo "未知参数: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
 FEISHU_APP_ID="${FEISHU_APP_ID:?请设置 FEISHU_APP_ID}"
 FEISHU_APP_SECRET="${FEISHU_APP_SECRET:?请设置 FEISHU_APP_SECRET}"
 FEISHU_RECEIVER="${FEISHU_RECEIVER:?请设置 FEISHU_RECEIVER}"
 
-log() { echo "[feishu-send] $*" >&2; }
+python3 - "$FEED_SOURCE" "$STATE_PATH" "$RAW_BASE_URL" "$TRACKING_URL" <<'PYEOF'
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 
-python3 - "$CACHE_DIR" "$FEISHU_APP_ID" "$FEISHU_APP_SECRET" "$FEISHU_RECEIVER" \
-  "${BITABLE_APP_TOKEN:-}" "${BITABLE_TABLE_ID:-}" << 'PYEOF'
-import sys, json, os, html, urllib.request, urllib.error, time
-from datetime import date
+(
+    feed_source,
+    state_path,
+    raw_base_url,
+    tracking_url,
+    ) = sys.argv[1:5]
 
-cache_dir = sys.argv[1]
-app_id = sys.argv[2]
-app_secret = sys.argv[3]
-receiver = sys.argv[4]
-bitable_app_token = sys.argv[5] if len(sys.argv) > 5 else ""
-bitable_table_id = sys.argv[6] if len(sys.argv) > 6 else ""
+app_id = os.environ["FEISHU_APP_ID"]
+app_secret = os.environ["FEISHU_APP_SECRET"]
+receiver = os.environ["FEISHU_RECEIVER"]
+bitable_app_token = os.environ.get("BITABLE_APP_TOKEN", "")
+bitable_table_id = os.environ.get("BITABLE_TABLE_ID", "")
 
-# ── 获取 tenant_access_token ──────────────────────────────
-def get_token():
-    req = urllib.request.Request(
+
+def log(msg):
+    print(f"[feishu-send] {msg}", file=sys.stderr)
+
+
+def http_json(url, payload=None, headers=None, timeout=30):
+    data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req_headers = {"Content-Type": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=data, headers=req_headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+        return json.loads(raw) if raw else {}
+
+
+def get_tenant_token():
+    resp = http_json(
         "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        data=json.dumps({"app_id": app_id, "app_secret": app_secret}).encode(),
-        headers={"Content-Type": "application/json"}
+        payload={"app_id": app_id, "app_secret": app_secret},
+        timeout=15,
     )
-    return json.loads(urllib.request.urlopen(req, timeout=15).read())["tenant_access_token"]
+    token = resp.get("tenant_access_token")
+    if not token:
+        raise RuntimeError(f"获取 tenant_access_token 失败: {resp}")
+    return token
 
-TOKEN = get_token()
 
-def feishu_post(url, payload):
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"}
-    )
-    try:
-        return json.loads(urllib.request.urlopen(req, timeout=30).read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        print(f"[feishu] HTTP {e.code}: {body[:200]}", file=sys.stderr)
-        return {}
+TOKEN = get_tenant_token()
 
-# ── 给用户开启文档编辑权限 ────────────────────────────────
+
+def feishu_post(url, payload, retries=3):
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    for attempt in range(1, retries + 1):
+        try:
+            return http_json(url, payload=payload, headers=headers, timeout=45)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            log(f"HTTPError {e.code} (attempt {attempt}/{retries}): {body[:300]}")
+            if attempt == retries:
+                return {"code": e.code, "msg": body}
+        except Exception as e:
+            log(f"请求失败 (attempt {attempt}/{retries}): {e}")
+            if attempt == retries:
+                return {"code": -1, "msg": str(e)}
+        time.sleep(attempt)
+    return {"code": -1, "msg": "unknown"}
+
+
 def grant_edit_permission(doc_token):
-    member_resp = feishu_post(
-        f"https://open.feishu.cn/open-apis/drive/v1/permissions/{doc_token}/members?type=docx&need_notification=false",
-        {"member_type": "openid", "member_id": receiver, "perm": "full_access"}
-    )
-    if member_resp.get("code") == 0:
-        print(f"[feishu] 已授予编辑权限", file=sys.stderr)
-    else:
-        print(f"[feishu] 授权失败: {member_resp}", file=sys.stderr)
+    payload = {
+        "member_type": "openid",
+        "member_id": receiver,
+        "perm": "full_access",
+    }
+    url = f"https://open.feishu.cn/open-apis/drive/v1/permissions/{doc_token}/members?type=docx&need_notification=false"
+    resp = feishu_post(url, payload)
+    if resp.get("code") != 0:
+        log(f"授予文档权限失败: {resp}")
 
-# ── 向文档追加 blocks ─────────────────────────────────────
-def append_blocks(doc_token, children):
-    for i in range(0, len(children), 50):
-        batch = children[i:i+50]
-        resp = feishu_post(
-            f"https://open.feishu.cn/open-apis/docx/v1/documents/{doc_token}/blocks/{doc_token}/children",
-            {"children": batch, "index": -1}
-        )
-        if resp.get("code") not in (0, None):
-            print(f"[feishu] 写入失败 batch {i//50}: {resp}", file=sys.stderr)
-        if i + 50 < len(children):
-            time.sleep(0.5)
 
-# ── 构建文本 block ────────────────────────────────────────
-def text_block(content, bold=False, bg_color=None):
-    if not content or not content.strip():
-        return None
-    element = {"text_run": {"content": content[:2000]}}
-    style_dict = {}
-    if bold:
-        style_dict["bold"] = True
-    if bg_color is not None:
-        style_dict["background_color"] = bg_color
-    if style_dict:
-        element["text_run"]["text_element_style"] = style_dict
+# 参考 feishu-cli 的设计：
+# 1) markdown 分段（避免把代码块打散）
+# 2) 每次最多 50 blocks
+# 3) 限流重试
+
+def split_markdown_segments(markdown_text):
+    lines = markdown_text.splitlines()
+    segments = []
+    buf = []
+    in_code = False
+
+    def flush_paragraph():
+        nonlocal buf
+        if buf:
+            content = "\n".join(buf).strip()
+            if content:
+                segments.append(("paragraph", content))
+            buf = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            if in_code:
+                buf.append(line)
+                segments.append(("code", "\n".join(buf).strip()))
+                buf = []
+                in_code = False
+            else:
+                flush_paragraph()
+                in_code = True
+                buf.append(line)
+            continue
+
+        if in_code:
+            buf.append(line)
+            continue
+
+        if re.match(r"^#{1,9}\s+", stripped):
+            flush_paragraph()
+            level = len(stripped) - len(stripped.lstrip("#"))
+            text = stripped[level:].strip()
+            if text:
+                segments.append((f"heading{min(level, 9)}", text))
+            continue
+
+        if stripped in {"---", "***", "___"}:
+            flush_paragraph()
+            segments.append(("divider", ""))
+            continue
+
+        if not stripped:
+            flush_paragraph()
+            continue
+
+        buf.append(line)
+
+    flush_paragraph()
+    return segments
+
+
+def text_block(content):
     return {
         "block_type": 2,
-        "text": {"elements": [element], "style": {}}
+        "text": {"elements": [{"text_run": {"content": content[:2000]}}], "style": {}},
     }
 
-def heading_block(content, level=2):
+
+def code_block(content):
+    return {
+        "block_type": 14,
+        "code": {
+            "elements": [{"text_run": {"content": content[:2000]}}],
+            "style": {"language": 49},
+        },
+    }
+
+
+def heading_block(level, content):
     block_type = 2 + level
-    key = "heading%d" % level
+    key = f"heading{level}"
     return {
         "block_type": block_type,
-        key: {
-            "elements": [{"text_run": {"content": content[:200]}}]
-        }
+        key: {"elements": [{"text_run": {"content": content[:200]}}]},
     }
+
 
 def divider_block():
     return {"block_type": 22, "divider": {}}
 
-# ── 从处理后的 JSON 创建结构化文档 ─────────────────────────
-def create_structured_doc(title, processed_json_path):
-    with open(processed_json_path, encoding="utf-8") as f:
-        data = json.load(f)
 
-    resp = feishu_post(
-        "https://open.feishu.cn/open-apis/docx/v1/documents",
-        {"title": title}
-    )
-    if resp.get("code") != 0:
-        print(f"[feishu] 创建文档失败: {resp}", file=sys.stderr)
-        return ""
+def markdown_to_blocks(markdown_text):
+    blocks = []
+    segments = split_markdown_segments(markdown_text)
 
-    doc_token = resp["data"]["document"]["document_id"]
-    doc_url = f"https://feishu.cn/docx/{doc_token}"
-    grant_edit_permission(doc_token)
-
-    children = []
-
-    # ── 摘要部分 ──
-    summary = data.get("summary", "")
-    if summary:
-        for line in summary.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("## "):
-                blk = heading_block(line[3:].strip(), level=2)
-                if blk:
-                    children.append(blk)
-            elif line.startswith("· ") or line.startswith("- "):
-                blk = text_block(line)
-                if blk:
-                    children.append(blk)
-            else:
-                blk = text_block(line)
-                if blk:
-                    children.append(blk)
-
-    children.append(divider_block())
-    children.append(heading_block("对话原文（中英双语）", level=2))
-
-    segments = data.get("segments", [])
-    chapter_segments = data.get("chapter_segments", {})
-
-    for si, seg in enumerate(segments):
-        seg_type = seg.get("type", "A")
-        en = seg.get("en", "").strip()
-        zh = seg.get("zh", "").strip()
-        is_highlight = seg.get("highlight", False)
-        if not en:
+    for kind, content in segments:
+        if kind.startswith("heading"):
+            level = int(kind.replace("heading", ""))
+            blocks.append(heading_block(level, content))
+            continue
+        if kind == "divider":
+            blocks.append(divider_block())
+            continue
+        if kind == "code":
+            blocks.append(code_block(content))
             continue
 
-        si_str = str(si)
-        if si_str in chapter_segments:
-            ch_title = chapter_segments[si_str]
-            children.append(divider_block())
-            children.append(heading_block(ch_title, level=3))
+        # paragraph
+        paragraph = content.strip()
+        while len(paragraph) > 1800:
+            cut = paragraph.rfind("\n", 0, 1800)
+            if cut < 200:
+                cut = 1800
+            part = paragraph[:cut].strip()
+            if part:
+                blocks.append(text_block(part))
+            paragraph = paragraph[cut:].strip()
+        if paragraph:
+            blocks.append(text_block(paragraph))
 
-        label = "【Q】" if seg_type == "Q" else "【A】"
-        bg = 7 if is_highlight else None
+    return blocks
 
-        prefix = "⭐ " if is_highlight else ""
-        en_blk = text_block(f"{prefix}{label} {en}", bg_color=bg)
-        if en_blk:
-            children.append(en_blk)
 
-        if zh and zh != "（翻译失败）":
-            zh_blk = text_block(f"　　{zh}", bg_color=bg)
-            if zh_blk:
-                children.append(zh_blk)
+def append_blocks(document_id, blocks):
+    if not blocks:
+        return True
 
-    if children:
-        print(f"[feishu] 写入 {len(children)} 个 blocks", file=sys.stderr)
-        append_blocks(doc_token, children)
+    url = f"https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/children"
+    batch_size = 50
 
-    return doc_url
+    for i in range(0, len(blocks), batch_size):
+        batch = blocks[i : i + batch_size]
+        payload = {"children": batch, "index": -1}
 
-# ── 从原始转录创建文档（降级方案）─────────────────────────
-def create_raw_doc(title, transcript_text):
+        # 限流重试
+        ok = False
+        for attempt in range(1, 6):
+            resp = feishu_post(url, payload)
+            code = resp.get("code")
+            if code == 0:
+                ok = True
+                break
+            msg = str(resp.get("msg", ""))
+            log(f"写入 blocks 失败 (batch {i//batch_size}, attempt {attempt}/5): {resp}")
+            if "too many requests" in msg.lower() or code in {99991663, 11247}:
+                time.sleep(min(8, attempt * 2))
+                continue
+            time.sleep(attempt)
+
+        if not ok:
+            return False
+
+    return True
+
+
+def create_doc_from_markdown(title, markdown_text):
     resp = feishu_post(
         "https://open.feishu.cn/open-apis/docx/v1/documents",
-        {"title": title}
+        {"title": title},
     )
     if resp.get("code") != 0:
-        print(f"[feishu] 创建文档失败: {resp}", file=sys.stderr)
+        log(f"创建文档失败: {resp}")
         return ""
 
     doc_token = resp["data"]["document"]["document_id"]
-    doc_url = f"https://feishu.cn/docx/{doc_token}"
     grant_edit_permission(doc_token)
 
-    text = html.unescape(transcript_text)
-    chunks = []
-    while text:
-        if len(text) <= 1500:
-            chunks.append(text)
-            break
-        cut = text.rfind(' ', 0, 1500)
-        if cut <= 0:
-            cut = 1500
-        chunks.append(text[:cut])
-        text = text[cut:].lstrip()
+    blocks = markdown_to_blocks(markdown_text)
+    ok = append_blocks(doc_token, blocks)
+    if not ok:
+        log(f"写入文档内容失败: {doc_token}")
 
-    children = []
-    for chunk in chunks:
-        blk = text_block(chunk)
-        if blk:
-            children.append(blk)
+    return f"https://feishu.cn/docx/{doc_token}"
 
-    if children:
-        print(f"[feishu] 写入 {len(children)} 个 blocks（原始模式）", file=sys.stderr)
-        append_blocks(doc_token, children)
 
-    return doc_url
+def read_json_source(source):
+    if source.startswith("http://") or source.startswith("https://"):
+        with urllib.request.urlopen(source, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    with open(source, encoding="utf-8") as f:
+        return json.load(f)
 
-# ── 读取 daily_message.txt 的元信息 ──────────────────────
-msg_file = os.path.join(cache_dir, "daily_message.txt")
-meta = {}
-blocks = []
-current = {}
-for line in open(msg_file):
-    line = line.rstrip()
-    if line == "---":
-        if current:
-            blocks.append(current)
-            current = {}
-    elif "=" in line and not line.startswith("FEISHU") and not line.startswith("FOUND") and not line.startswith("TODAY"):
-        k, v = line.split("=", 1)
-        current[k] = v
-    elif line.startswith("TODAY_DISPLAY="):
-        meta["today"] = line.split("=", 1)[1]
-    elif line.startswith("FOUND_COUNT="):
-        meta["count"] = line.split("=", 1)[1]
 
-today = meta.get("today", f"{date.today().month}月{date.today().day}日")
-count = meta.get("count", str(len(blocks)))
-today_iso = date.today().isoformat()
-
-def read_summary(key):
-    sf = os.path.join(cache_dir, f"summary_{key}.txt")
-    if os.path.exists(sf):
-        return open(sf).read().strip()
-    return ""
-
-def read_transcript(transcript_path):
-    if transcript_path and os.path.exists(transcript_path):
-        return open(transcript_path, encoding="utf-8", errors="replace").read().strip()
-    return ""
-
-# ── 多维表格配置 ─────────────────────────────────────────
-LEVEL_LABELS = {"P0": "P0 特别推荐", "P1": "P1 一般推荐", "P2": "P2 空闲再看"}
-
-def recommend_by_keywords(podcast_name, title):
-    p0_podcasts = {"No Priors", "Latent Space", "Lenny's Podcast", "Dwarkesh Podcast"}
-    p0_keywords = ["ai", "product", "startup", "agent", "llm", "founder", "ceo",
-                   "notion", "anthropic", "openai", "google", "meta", "infrastructure"]
-    if podcast_name in p0_podcasts:
-        return "P0"
-    for kw in p0_keywords:
-        if kw in title.lower():
-            return "P0"
-    p1_podcasts = {"Lex Fridman Podcast", "Hard Fork (NYT)", "TWIML AI Podcast",
-                   "All-In Podcast", "The Knowledge Project"}
-    if podcast_name in p1_podcasts:
-        return "P1"
-    return "P2"
-
-def extract_guest(title):
-    import re
-    m = re.search(r'(?:with|featuring)\s+(.+?)(?:\s*[-\u2013\u2014]|$)', title, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r'#\d+\s*[-\u2013\u2014:]\s*(.+)', title)
-    if m:
-        return re.split(r'\s*[-\u2013\u2014:]\s*', m.group(1).strip())[0].strip()
-    m = re.search(r'The\s+(.+?)\s+Interview', title, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return ""
-
-def extract_section(summary, section_name):
-    if not summary:
+def read_markdown_content(path_or_rel):
+    if not path_or_rel:
         return ""
-    lines = summary.split("\n")
-    result = []
-    in_section = False
-    for line in lines:
-        s = line.strip()
-        if s.startswith("## ") or s.startswith("# "):
-            if in_section:
-                break
-            if section_name in s:
-                in_section = True
-                continue
-        elif in_section and s:
-            result.append(s)
-    return "\n".join(result)
 
-# ── 组装飞书消息 + 创建文档 + 收集表格数据 ────────────────
-lines = [f"\U0001f399\ufe0f \u64ad\u5ba2\u65e5\u62a5 \u00b7 {today}", ""]
-bitable_records = []
+    if os.path.exists(path_or_rel):
+        with open(path_or_rel, encoding="utf-8", errors="replace") as f:
+            return f.read()
 
-for b in blocks:
-    name  = b.get("PODCAST_NAME", "")
-    title = html.unescape(b.get("PODCAST_TITLE", ""))
-    link  = b.get("PODCAST_LINK", "")
-    transcript_path = b.get("PODCAST_TRANSCRIPT", "")
-    key   = b.get("PODCAST_SUMMARY", "").split("/summary_")[-1].replace(".txt", "") if "PODCAST_SUMMARY" in b else ""
+    # 相对 feed 路径，尝试拼接 feed 文件所在目录
+    if not (feed_source.startswith("http://") or feed_source.startswith("https://")):
+        base_dir = os.path.dirname(os.path.abspath(feed_source))
+        local_try = os.path.join(base_dir, path_or_rel)
+        if os.path.exists(local_try):
+            with open(local_try, encoding="utf-8", errors="replace") as f:
+                return f.read()
 
-    processed_json = os.path.join(cache_dir, f"processed_{key}.json")
-    pdata = None
-    summary = ""
-    if os.path.exists(processed_json):
-        with open(processed_json, encoding="utf-8") as f:
-            pdata = json.load(f)
-        summary = pdata.get("summary", "")
-    else:
-        summary = read_summary(key)
+    # 远程 raw 回源
+    if raw_base_url:
+        url = raw_base_url.rstrip("/") + "/" + path_or_rel.lstrip("/")
+        try:
+            with urllib.request.urlopen(url, timeout=20) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            log(f"拉取远程 markdown 失败: {url} ({e})")
 
-    lines.append(f"\u2501\u2501\u2501 {name} \u2501\u2501\u2501")
-    lines.append(f"\U0001f4cc {title}")
-    if link:
-        lines.append(f"\U0001f517 {link}")
+    return ""
 
-    if summary:
-        for sl in summary.split("\n"):
-            sl = sl.strip()
-            if sl:
-                sl = sl.lstrip("*# ").lstrip("1234567890. ")
-                if sl:
-                    lines.append(f"  {sl}")
 
-    doc_url = ""
-    if transcript_path and os.path.exists(transcript_path):
-        doc_title = f"[\u64ad\u5ba2\u539f\u6587] {name} \u00b7 {title[:30]} \u00b7 {today_iso}"
-        print(f"[feishu] 创建文档: {doc_title}", file=sys.stderr)
+def load_state(path):
+    if not os.path.exists(path):
+        return {"sentFeedDates": [], "sentEpisodeIds": [], "lastSentAt": ""}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"sentFeedDates": [], "sentEpisodeIds": [], "lastSentAt": ""}
+        data.setdefault("sentFeedDates", [])
+        data.setdefault("sentEpisodeIds", [])
+        data.setdefault("lastSentAt", "")
+        return data
+    except Exception:
+        return {"sentFeedDates": [], "sentEpisodeIds": [], "lastSentAt": ""}
 
-        if os.path.exists(processed_json):
-            doc_url = create_structured_doc(doc_title, processed_json)
-        else:
-            raw_text = read_transcript(transcript_path)
-            if raw_text:
-                doc_url = create_raw_doc(doc_title, raw_text)
 
-        if doc_url:
-            lines.append(f"\U0001f4c4 完整转录原文: {doc_url}")
+def save_state(path, state):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
-    lines.append("")
 
-    # ── 收集多维表格记录 ──
-    level = "P1"
-    if pdata and pdata.get("recommend_level"):
-        level = pdata["recommend_level"]
-    else:
-        level = recommend_by_keywords(name, title)
+def recommendation_label(level):
+    return {
+        "P0": "P0 特别推荐",
+        "P1": "P1 一般推荐",
+        "P2": "P2 空闲再看",
+    }.get(level, "P1 一般推荐")
 
-    guest = extract_guest(title)
-    core_summary = extract_section(summary, "核心摘要")
-    if not core_summary:
-        slines = [l.strip() for l in summary.split("\n") if l.strip() and not l.strip().startswith("#")]
-        core_summary = "\n".join(slines[:5])
-    pm_insights = extract_section(summary, "产品经理 Insight")
-    quotes = extract_section(summary, "精彩金句")
 
-    from datetime import datetime
-    dt = datetime.strptime(today_iso, "%Y-%m-%d")
-    ts_ms = int(dt.timestamp() * 1000)
+def safe_list(value):
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
 
-    fields = {
-        "播客名称": name,
-        "集标题": title,
-        "嘉宾": guest,
-        "日期": ts_ms,
-        "推荐等级": LEVEL_LABELS.get(level, "P1 一般推荐"),
+
+def format_feed_date(date_str):
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+        return f"{d.month}月{d.day}日"
+    except Exception:
+        now = datetime.now()
+        return f"{now.month}月{now.day}日"
+
+
+def send_interactive_card(card):
+    payload = {
+        "receive_id": receiver,
+        "msg_type": "interactive",
+        "content": json.dumps(card, ensure_ascii=False),
     }
-    if core_summary:
-        fields["核心摘要"] = core_summary[:2000]
-    if pm_insights:
-        fields["PM Insights"] = pm_insights[:2000]
-    if quotes:
-        fields["精彩金句"] = quotes[:2000]
-    if doc_url:
-        fields["原文文档"] = {"link": doc_url, "text": "[\u67e5\u770b\u539f\u6587]"}
-    if link:
-        fields["播客链接"] = {"link": link, "text": title[:50]}
+    url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
+    resp = feishu_post(url, payload)
+    if resp.get("code") != 0:
+        raise RuntimeError(f"发送飞书卡片失败: {resp}")
+    return resp.get("data", {}).get("message_id", "")
 
-    bitable_records.append({"fields": fields})
 
-lines.append(f"\U0001f4ee \u4eca\u65e5\u5171 {count} \u671f\u65b0\u96c6 | \u6df1\u5ea6\u6458\u8981 + \u7ffb\u8bd1 by AI")
+def build_card(feed_date, episodes):
+    title = f"🎙️ 播客日报 · {format_feed_date(feed_date)}"
+    elements = []
 
-message = "\n".join(lines)
+    if episodes:
+        for ep in episodes:
+            summary = ep.get("summary", {}) or {}
+            key_points = safe_list(summary.get("key_points"))[:3]
+            quotes = safe_list(summary.get("golden_quotes"))[:2]
+            insights = safe_list(summary.get("pm_insights"))[:2]
+            rec_label = recommendation_label(ep.get("recommendation", "P1"))
+            duration = ep.get("duration", "")
+            line_meta = f"⏱️ {duration}  |  ⭐ {rec_label}" if duration else f"⭐ {rec_label}"
 
-# ── 发送 ──────────────────────────────────────────────────
-payload = json.dumps({
-    "receive_id": receiver,
-    "msg_type": "text",
-    "content": json.dumps({"text": message})
-}).encode()
+            block_lines = [
+                f"📻 **{ep.get('name', '')}**",
+                f"🎙️ {ep.get('title', '')}",
+                line_meta,
+            ]
 
-req = urllib.request.Request(
-    "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
-    data=payload,
-    headers={"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"}
-)
-resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
-if resp.get("code") == 0:
-    print(f"[feishu-send] 发送成功: {resp['data']['message_id']}")
-else:
-    print(f"[feishu-send] 发送失败: {resp}", file=sys.stderr)
-    sys.exit(1)
+            if key_points:
+                block_lines.append("\n**核心观点：**")
+                for kp in key_points:
+                    block_lines.append(f"- {kp}")
 
-# ── 写入多维表格 ─────────────────────────────────────────
-if bitable_records and bitable_app_token and bitable_table_id:
-    print(f"[feishu-send] 写入多维表格: {len(bitable_records)} 条记录", file=sys.stderr)
-    for i in range(0, len(bitable_records), 10):
-        batch = bitable_records[i:i+10]
-        bt_resp = feishu_post(
-            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{bitable_app_token}/tables/{bitable_table_id}/records/batch_create",
-            {"records": batch}
+            if quotes:
+                block_lines.append("\n**💬 金句：**")
+                for q in quotes:
+                    block_lines.append(f"> {q}")
+
+            if insights:
+                block_lines.append("\n**🛠️ PM 洞察：**")
+                for it in insights:
+                    block_lines.append(f"- {it}")
+
+            if ep.get("doc_url"):
+                block_lines.append(f"\n📄 双语原文：[查看飞书文档]({ep['doc_url']})")
+
+            elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(block_lines)}})
+            elements.append({"tag": "hr"})
+
+        elements.append(
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"📮 今日共 **{len(episodes)}** 期新集",
+                },
+            }
         )
-        bt_code = bt_resp.get("code", "?")
-        print(f"[feishu-send] bitable batch {i//10}: code={bt_code}", file=sys.stderr)
-        if bt_code != 0:
-            print(f"[feishu-send] bitable error: {bt_resp.get('msg', '')[:200]}", file=sys.stderr)
-        if i + 10 < len(bitable_records):
-            time.sleep(0.5)
-    print(f"[feishu-send] 多维表格写入完成")
+    else:
+        elements.append(
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "所有订阅均无新集，明日见～",
+                },
+            }
+        )
+
+    elements.append(
+        {
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "📊 查看播客追踪表"},
+                    "type": "primary",
+                    "url": tracking_url,
+                }
+            ],
+        }
+    )
+
+    return {
+        "config": {"wide_screen_mode": True, "enable_forward": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+            "template": "blue",
+        },
+        "elements": elements,
+    }
+
+
+def write_bitable_records(episodes):
+    if not episodes or not bitable_app_token or not bitable_table_id:
+        return
+
+    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{bitable_app_token}/tables/{bitable_table_id}/records"
+
+    for ep in episodes:
+        summary = ep.get("summary", {}) or {}
+        published = ep.get("publishedAt", "")
+        ts_ms = int(time.time() * 1000)
+        if published:
+            try:
+                dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                ts_ms = int(dt.timestamp() * 1000)
+            except Exception:
+                pass
+
+        fields = {
+            "播客名称": ep.get("name", ""),
+            "集标题": ep.get("title", ""),
+            "日期": ts_ms,
+            "推荐等级": recommendation_label(ep.get("recommendation", "P1")),
+            "核心摘要": "\n".join(safe_list(summary.get("key_points"))[:3])[:2000],
+            "PM Insights": "\n".join(safe_list(summary.get("pm_insights"))[:3])[:2000],
+            "精彩金句": "\n".join(safe_list(summary.get("golden_quotes"))[:2])[:2000],
+        }
+
+        if ep.get("doc_url"):
+            fields["原文文档"] = {"text": "[查看原文]", "link": ep["doc_url"]}
+        if ep.get("link"):
+            fields["播客链接"] = {"text": ep.get("title", "")[:80], "link": ep["link"]}
+
+        resp = feishu_post(url, {"fields": fields})
+        if resp.get("code") != 0:
+            log(f"写入多维表格失败: {resp}")
+        time.sleep(0.2)
+
+
+def pick_new_episodes(feed, state):
+    feed_date = str(feed.get("date", "")).strip()
+    episodes = feed.get("episodes", [])
+    if not isinstance(episodes, list):
+        episodes = []
+
+    sent_ids = set(state.get("sentEpisodeIds", []))
+    out = []
+    for ep in episodes:
+        ep_id = ep.get("id") or f"{ep.get('key', '')}_{ep.get('title', '')}"
+        if ep_id in sent_ids:
+            continue
+        ep = dict(ep)
+        ep["_id"] = ep_id
+        out.append(ep)
+
+    return feed_date, out
+
+
+def main():
+    feed = read_json_source(feed_source)
+    state = load_state(state_path)
+
+    feed_date, new_eps = pick_new_episodes(feed, state)
+    if not feed_date:
+        feed_date = datetime.now().strftime("%Y-%m-%d")
+
+    # 如果这个 feed 日期已经发过，直接退出
+    if feed_date in set(state.get("sentFeedDates", [])):
+        log(f"日期 {feed_date} 已推送，跳过")
+        print("SKIP_ALREADY_SENT")
+        return
+
+    # 先创建文档链接
+    for ep in new_eps:
+        transcript_info = ep.get("transcript", {}) or {}
+        md_path = transcript_info.get("bilingualUrl", "")
+        markdown = read_markdown_content(md_path)
+        if not markdown:
+            ep["doc_url"] = ""
+            continue
+
+        title = ep.get("title", "")
+        podcast_name = ep.get("name", "")
+        doc_title = f"[播客双语原文] {podcast_name} · {title[:60]}"
+        log(f"创建飞书文档: {doc_title}")
+        ep["doc_url"] = create_doc_from_markdown(doc_title, markdown)
+
+    card = build_card(feed_date, new_eps)
+    message_id = send_interactive_card(card)
+    log(f"卡片发送成功: {message_id}")
+
+    write_bitable_records(new_eps)
+
+    # 更新状态
+    sent_dates = state.get("sentFeedDates", [])
+    sent_dates.append(feed_date)
+    state["sentFeedDates"] = sent_dates[-60:]
+
+    sent_episode_ids = state.get("sentEpisodeIds", [])
+    sent_episode_ids.extend([ep.get("_id") for ep in new_eps])
+    # 去重并截断
+    dedup = []
+    seen = set()
+    for eid in reversed(sent_episode_ids):
+        if not eid or eid in seen:
+            continue
+        seen.add(eid)
+        dedup.append(eid)
+    state["sentEpisodeIds"] = list(reversed(dedup))[-1000:]
+
+    state["lastSentAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state["lastFeedDate"] = feed_date
+
+    save_state(state_path, state)
+
+    print(json.dumps({
+        "feedDate": feed_date,
+        "newEpisodes": len(new_eps),
+        "messageId": message_id,
+        "state": state_path,
+    }, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
 PYEOF

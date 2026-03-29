@@ -1,0 +1,45 @@
+name: Podcast Daily Digest
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yt-dlp
+
+      - name: Run podcast pipeline
+        env:
+          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+          ARK_BASE_URL: https://ark.cn-beijing.volces.com/api/coding/v3
+          ARK_ENDPOINT: https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions
+          TRANSLATE_MODEL: doubao-seed-2.0-lite
+          SUMMARY_MODEL: glm-4.7
+        run: |
+          bash scripts/podcast-daily.sh
+
+      - name: Commit and push outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add feed-podcasts.json state-feed.json transcripts/
+          git diff --cached --quiet || git commit -m "chore: update podcast feed $(date +%Y-%m-%d) [skip ci]"
+          git push
