@@ -1,184 +1,91 @@
 ---
 name: podcast-daily
-description: "Automated podcast daily digest workflow: RSS monitoring, audio transcription (YouTube subtitles + Volcengine ASR), AI-powered translation and summarization (Volcengine Doubao/Ark), Feishu/Lark message delivery and document archiving, and Bitable (multi-dimensional table) tracking. Use this skill when the user wants to set up a podcast monitoring pipeline, generate podcast summaries, send daily podcast digests via Feishu, manage podcast records in a spreadsheet/database, or automate any podcast-related workflow. Also trigger when the user mentions: podcast transcription, RSS feed processing, Feishu document creation, podcast recommendation ranking, or bilingual transcript generation."
+description: "播客日报 v2：GitHub Actions 负责 RSS/转录/翻译/摘要生产，Luna 端只做 feed 驱动的飞书推送（卡片 + 文档 + 多维表格）。当用户要搭建播客监控、双语转录、日报推送、飞书自动化时使用。"
 ---
 
-# Podcast Daily Digest Skill
+# Podcast Daily Skill (v2)
 
-Automated daily podcast monitoring and summarization pipeline with Feishu/Lark integration.
+## 能力概览
 
-## What This Skill Does
+本技能将播客日报拆为两段：
 
-This skill provides a complete end-to-end podcast digest workflow:
+1. 生产端（GitHub Actions）：`scripts/podcast-daily.sh`
+- RSS 发现新集
+- 获取字幕并转录
+- 连续重复段去重
+- 段落级英中翻译
+- 中文结构化摘要
+- 产出 `feed-podcasts.json`、`transcripts/*`、`state-feed.json`
 
-1. **RSS Monitoring** — Polls 11+ podcast RSS feeds for new episodes within configurable time windows
-2. **Transcription** — Obtains transcripts via YouTube subtitles (free, fast) or Volcengine BigASR (fallback)
-3. **AI Processing** — Cleans, segments, translates (EN→ZH), generates structured summaries with golden quotes, PM insights, and recommendation levels (P0/P1/P2)
-4. **Feishu Delivery** — Sends daily digest message + creates structured bilingual documents with chapter headings, highlighted segments, and Q/A formatting
-5. **Bitable Tracking** — Writes episode records to a Feishu Bitable (multi-dimensional table) with fields for podcast name, title, guest, date, recommendation level, summary, PM insights, quotes, and links
-6. **Deduplication** — Three-layer dedup: source-level (cross-day title check), transcript cache (reuse across days), and processed JSON cache (skip re-processing)
+2. 推送端（Luna/OpenClaw）：`scripts/feishu-send.sh`
+- 读取 feed（本地文件或 GitHub raw URL）
+- 从 Markdown 创建飞书文档
+- 推送互动卡片（含追踪表按钮）
+- 写入多维表格（可选）
+- 本地去重（`.feishu-push-state.json`）
 
-## Architecture
+## 关键修复
 
-```
-podcast-daily.sh (orchestrator)
-├── parse_rss.py          — RSS XML parsing, time window filtering
-├── extract_vtt.py        — YouTube VTT subtitle dedup + timed JSONL output
-├── process-transcript.py — Clean → Segment → Translate → Summarize → Tag
-└── feishu-send.sh        — Feishu message + document + bitable integration
-```
+- 转录缓存错配修复：缓存键从 `key` 升级为 `key + title_hash`
+- heartbeat 超时规避：耗时链路迁移到 Actions
+- 转录重复段修复：清洗阶段去除连续重复段
 
-## Prerequisites
+## 目录结构
 
-### Required Environment Variables
+- `scripts/podcast-daily.sh`：生产主脚本
+- `scripts/process-transcript.py`：清洗/翻译/摘要/Markdown
+- `scripts/feishu-send.sh`：feed 到飞书
+- `prompts/summarize-podcast.md`
+- `prompts/translate-bilingual.md`
+- `.github/workflows/podcast-daily.yml`
+- `feed-podcasts.json`
+- `state-feed.json`
+- `transcripts/`
 
-All secrets must be set as environment variables. **Never hardcode secrets.**
+## 环境变量
 
-| Variable | Description | Where to get |
-|---|---|---|
-| `FEISHU_APP_ID` | Feishu app ID | [Feishu Open Platform](https://open.feishu.cn/) |
-| `FEISHU_APP_SECRET` | Feishu app secret | Feishu Open Platform |
-| `FEISHU_RECEIVER` | Recipient's open_id | Feishu API |
-| `ARK_API_KEY` | Volcengine Ark API key | [Volcengine Console](https://console.volcengine.com/) |
-| `ARK_ENDPOINT` | Ark API endpoint URL | Provider's API docs |
-| `BITABLE_APP_TOKEN` | Feishu Bitable app token | Create a Bitable, get from URL |
-| `BITABLE_TABLE_ID` | Feishu Bitable table ID | Create a table, get from URL |
+### 生产端必填
 
-### Optional Environment Variables
+- `ARK_API_KEY`
 
-| Variable | Default | Description |
-|---|---|---|
-| `VOLC_APPID` | _(none)_ | Volcengine ASR app key (for audio fallback) |
-| `VOLC_TOKEN` | _(none)_ | Volcengine ASR access key |
-| `TRANSLATE_MODEL` | `doubao-seed-2-0-mini-260215` | Ark model for translation |
-| `SUMMARY_MODEL` | `doubao-seed-2-0-mini-260215` | Ark model for summarization |
-| `RECOMMEND_MODE` | `ai` | `ai` or `keywords` for recommendation tagging |
-| `FEISHU_USER_ID` | _(none)_ | Additional user ID for metadata |
+### 生产端可选
 
-### Required Feishu App Permissions
+- `ARK_BASE_URL`（默认 `https://ark.cn-beijing.volces.com/api/coding/v3`）
+- `ARK_ENDPOINT`（默认 `${ARK_BASE_URL}/chat/completions`）
+- `TRANSLATE_MODEL`（默认 `doubao-seed-2.0-lite`）
+- `SUMMARY_MODEL`（默认 `glm-4.7`）
+- `PODCAST_CONFIG`（自定义播客配置）
 
-The Feishu app needs these scopes:
-- `im:message:send_as_bot` — Send messages
-- `docx:document` — Create/edit documents
-- `drive:drive` — File permissions
-- `bitable:app` — Read/write Bitable
+### 推送端必填
 
-### System Dependencies
+- `FEISHU_APP_ID`
+- `FEISHU_APP_SECRET`
+- `FEISHU_RECEIVER`
 
-- `python3` (3.8+)
-- `bash` (3.2+ compatible, no bash 4+ features used)
-- `yt-dlp` — For YouTube subtitle extraction
-- `curl` — For RSS fetching
+### 推送端可选
 
-## Setup Instructions
+- `BITABLE_APP_TOKEN`
+- `BITABLE_TABLE_ID`
+- `RAW_BASE_URL`
+- `TRACKING_URL`
 
-### Step 1: Install the skill scripts
-
-Copy all files from `scripts/` to your working directory (e.g., `~/podcast-workflow/scripts/`):
+## 常用命令
 
 ```bash
-SKILL_DIR="<path-to-this-skill>/scripts"
-TARGET_DIR="~/podcast-workflow/scripts"
-mkdir -p "$TARGET_DIR"
-cp "$SKILL_DIR"/*.sh "$SKILL_DIR"/*.py "$TARGET_DIR/"
-chmod +x "$TARGET_DIR"/*.sh
+# 生产端（建议在 GitHub Actions）
+bash scripts/podcast-daily.sh
+
+# 推送端（本地文件）
+bash scripts/feishu-send.sh --feed ./feed-podcasts.json
+
+# 推送端（GitHub raw）
+bash scripts/feishu-send.sh \
+  --feed https://raw.githubusercontent.com/<owner>/<repo>/main/feed-podcasts.json \
+  --raw-base-url https://raw.githubusercontent.com/<owner>/<repo>/main
 ```
 
-### Step 2: Configure environment variables
+## 注意事项
 
-Create a `.env` file (do NOT commit this file):
-
-```bash
-export FEISHU_APP_ID="your_app_id"
-export FEISHU_APP_SECRET="your_app_secret"
-export FEISHU_RECEIVER="recipient_open_id"
-export ARK_API_KEY="your_ark_api_key"
-export BITABLE_APP_TOKEN="your_bitable_app_token"
-export BITABLE_TABLE_ID="your_bitable_table_id"
-# Optional
-export VOLC_APPID="your_volc_appid"
-export VOLC_TOKEN="your_volc_token"
-```
-
-### Step 3: Create Feishu Bitable
-
-Create a Bitable with these fields:
-- 播客名称 (Text)
-- 集标题 (Text)
-- 嘉宾 (Text)
-- 日期 (Date)
-- 推荐等级 (Single Select: P0 特别推荐 / P1 一般推荐 / P2 空闲再看)
-- 核心摘要 (Text)
-- PM Insights (Text)
-- 精彩金句 (Text)
-- 原文文档 (URL)
-- 播客链接 (URL)
-
-### Step 4: Set up cron job (optional)
-
-```bash
-# Run daily at 17:00
-0 17 * * * source ~/.env && bash ~/podcast-workflow/scripts/podcast-daily.sh >> ~/podcast-daily.log 2>&1
-```
-
-### Step 5: Test run
-
-```bash
-source .env
-bash scripts/podcast-daily.sh --test
-```
-
-## Customizing Podcast Subscriptions
-
-Copy `podcasts.example.json` to your workspace as `podcasts.json` and edit it:
-
-```bash
-cp podcasts.example.json ~/podcast-workflow/podcasts.json
-```
-
-Each podcast entry has these fields:
-
-```json
-{
-  "key": "MyPodcast",
-  "name": "My Favorite Podcast",
-  "rss": "https://example.com/feed/rss",
-  "hours": 168,
-  "youtube": "https://www.youtube.com/@mypodcast"
-}
-```
-
-| Field | Required | Description |
-|---|---|---|
-| `key` | Yes | Internal identifier (no spaces, used for cache file names) |
-| `name` | Yes | Display name shown in digest messages |
-| `rss` | Yes | RSS feed URL |
-| `hours` | No | Time window in hours (default: 168 = 7 days) |
-| `youtube` | No | YouTube channel URL for free subtitle extraction |
-
-**Config file lookup order:**
-1. `PODCAST_CONFIG` environment variable (absolute path)
-2. `podcasts.json` in the workspace directory
-3. Built-in default list (11 podcasts)
-
-To add a podcast, just append an entry to the `podcasts` array. To remove one, delete its entry. No code changes needed.
-
-## How the AI Processing Works
-
-The `process-transcript.py` script performs these steps:
-
-1. **Clean** — Strip HTML, timestamps, noise markers
-2. **Segment** — Split into ~500-char segments at sentence boundaries
-3. **Detect Q/A** — Mark segments as Question or Answer
-4. **Chapter mapping** — Align segments to YouTube chapters via timed subtitle data
-5. **Translate** — Batch translate EN→ZH (10 segments per batch, ~60 API calls for a typical episode)
-6. **Summarize + Tag** — Single API call generates: recommendation level (P0/P1/P2), core summary, key insights, golden quotes, PM insights, recommended tools
-7. **Highlight** — Match golden quotes back to source segments for visual highlighting
-
-## Cost Optimization
-
-- Translation uses `doubao-seed-2-0-mini` (128K context, low cost)
-- Summary + recommendation merged into single API call (saves 1 call/episode)
-- Batch size of 10 segments halves translation API calls
-- Three-layer caching prevents redundant processing
-- YouTube subtitles are free; ASR is only used as fallback
+- `state-feed.json` 需要提交到仓库（生产去重状态）。
+- `.feishu-push-state.json` 为本地推送状态，不应提交。
+- 推送脚本的 Markdown→文档采用“分段 + 50 块批量 + 限流重试”策略，参考了 `feishu-cli` 的导入设计。

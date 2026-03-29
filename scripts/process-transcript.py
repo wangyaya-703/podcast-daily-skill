@@ -1,352 +1,425 @@
 #!/usr/bin/env python3
-# process-transcript.py — 播客转录后处理
-# 清洗 → 章节分段 → 翻译 → Q/A格式化 → 增强摘要+金句 → 高亮标记
-#
-# 用法: python3 process-transcript.py <transcript.txt> <podcast_name> <episode_title> --out <output.json>
-#       [--chapters chapters.json] [--timed timed.jsonl]
-#
-# 必需环境变量: ARK_API_KEY
-# 可选环境变量: ARK_ENDPOINT, TRANSLATE_MODEL, SUMMARY_MODEL, RECOMMEND_MODE
+"""process-transcript.py — 播客转录处理（v2）
 
-import sys, json, os, re, html, urllib.request, urllib.error, time, argparse
+流程：
+1. 清洗转录文本
+2. 段落切分 + 连续重复段去重
+3. 段落级英中翻译（双语对照）
+4. 结构化中文摘要（one_liner/key_points/golden_quotes/pm_insights/recommendation）
+5. 可选输出双语 Markdown 文档
+"""
 
-ARK_API_KEY = os.environ.get("ARK_API_KEY")
-if not ARK_API_KEY:
-    print("错误: 请设置 ARK_API_KEY 环境变量", file=sys.stderr)
-    sys.exit(1)
+import argparse
+import html
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
 
-TRANSLATE_MODEL = os.environ.get("TRANSLATE_MODEL", "doubao-seed-2-0-mini-260215")
-SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "doubao-seed-2-0-mini-260215")
-ARK_ENDPOINT = os.environ.get("ARK_ENDPOINT")
-if not ARK_ENDPOINT:
-    print("错误: 请设置 ARK_ENDPOINT 环境变量（例如: https://your-provider/api/v3/chat/completions）", file=sys.stderr)
-    sys.exit(1)
+ARK_API_KEY = os.environ.get("ARK_API_KEY", "")
+ARK_BASE_URL = os.environ.get("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3").rstrip("/")
+ARK_ENDPOINT = os.environ.get("ARK_ENDPOINT", f"{ARK_BASE_URL}/chat/completions")
+TRANSLATE_MODEL = os.environ.get("TRANSLATE_MODEL", "doubao-seed-2.0-lite")
+SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "glm-4.7")
 
-def log(msg):
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
+PROMPTS_DIR = os.path.join(ROOT_DIR, "prompts")
+
+DEFAULT_TRANSLATE_PROMPT = """你是资深科技播客翻译编辑。请把英文段落翻译为自然、准确的中文。
+要求：
+- 保留术语英文：AI, LLM, GPU, API, transformer, RAG, token, prompt, agent 等
+- 人名、公司名、产品名保留英文
+- URL 保持不变
+- 语气专业但口语化
+只输出中文翻译，不要解释。"""
+
+DEFAULT_SUMMARY_PROMPT = """你正在为忙碌的产品经理重写播客内容。请基于英文转录输出简洁洞察。
+输出必须是 JSON，字段：
+- one_liner: 一句话核心结论（中文）
+- key_points: 3 条核心观点（数组）
+- golden_quotes: 1-2 条英文金句（数组）
+- pm_insights: 1-3 条 PM 视角洞察（数组）
+- tools_mentioned: 提到的工具/方法（数组，可空）
+- recommendation: P0/P1/P2 之一
+- summary_zh: 200-400 字中文摘要
+只输出合法 JSON。"""
+
+
+def log(msg: str) -> None:
     print(f"[process] {msg}", file=sys.stderr)
 
-# ── Ark API ───────────────────────────────────────────────
-def ark_chat(prompt, model=TRANSLATE_MODEL, max_tokens=4096, temperature=0.3):
-    payload = json.dumps({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": temperature
-    }).encode()
-    req = urllib.request.Request(
-        ARK_ENDPOINT, data=payload,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {ARK_API_KEY}"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            d = json.loads(resp.read())
-            return d["choices"][0]["message"]["content"].strip()
-    except urllib.error.HTTPError as e:
-        log(f"API 错误 HTTP {e.code}: {e.read().decode()[:200]}")
-        return ""
-    except Exception as e:
-        log(f"API 调用失败: {e}")
-        return ""
 
-# ── 文本清洗 ──────────────────────────────────────────────
-def clean_text(text):
+def ensure_env() -> None:
+    if not ARK_API_KEY:
+        print("错误: 请设置 ARK_API_KEY 环境变量", file=sys.stderr)
+        sys.exit(1)
+
+
+def load_prompt(filename: str, default: str) -> str:
+    path = os.path.join(PROMPTS_DIR, filename)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            content = f.read().strip()
+            if content:
+                return content
+    return default
+
+
+def ark_chat(prompt: str, model: str, max_tokens: int = 4096, temperature: float = 0.2) -> str:
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        ARK_ENDPOINT,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {ARK_API_KEY}",
+        },
+    )
+
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                data = json.loads(resp.read())
+                return data["choices"][0]["message"]["content"].strip()
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            log(f"HTTP 错误 (attempt {attempt}/3): {e.code}, {body[:200]}")
+        except Exception as e:
+            log(f"API 调用失败 (attempt {attempt}/3): {e}")
+        time.sleep(attempt)
+    return ""
+
+
+def clean_text(text: str) -> str:
     text = html.unescape(text)
-    text = re.sub(r'<[^>]+>', '', text)
-    text = re.sub(r'\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[.,]\d{3}', '', text)
-    text = re.sub(r'>>\s*', '', text)
-    text = re.sub(r'\[(?:music|applause|laughter)\]', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[.,]\d{3}", "", text)
+    text = re.sub(r"\[(music|applause|laughter)\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
-# ── 分段 ──────────────────────────────────────────────────
-def split_into_segments(text, max_chars=500):
-    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
+
+def normalize_for_dedup(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", s)
+    return s
+
+
+def split_into_segments(text: str, max_chars: int = 1200):
+    # 优先按句子边界切块，避免逐句调用模型导致成本暴涨
+    sentences = re.split(r"(?<=[.!?。！？])\s+", text)
     segments = []
-    current = ""
+    cur = ""
+
     for sent in sentences:
-        if len(current) + len(sent) + 1 > max_chars and current:
-            segments.append(current.strip())
-            current = sent
+        sent = sent.strip()
+        if not sent:
+            continue
+
+        if len(cur) + len(sent) + 1 <= max_chars:
+            cur = f"{cur} {sent}".strip()
+            continue
+
+        if cur:
+            segments.append(cur)
+
+        # 单句超长时强制切片
+        if len(sent) > max_chars:
+            for i in range(0, len(sent), max_chars):
+                segments.append(sent[i : i + max_chars].strip())
+            cur = ""
         else:
-            current = (current + " " + sent).strip()
-    if current:
-        segments.append(current.strip())
-    return [s for s in segments if len(s) > 10]
+            cur = sent
 
-# ── Q/A 类型检测 ──────────────────────────────────────────
-def detect_qa_type(segment):
-    s = segment.strip()
-    if s.endswith('?') and len(s) < 300:
-        return "Q"
-    q_starters = ['what ', 'how ', 'why ', 'when ', 'where ', 'who ',
-                  'do you ', 'can you ', 'could you ', 'would you ',
-                  'tell me', 'is it ', 'are you ', 'have you ',
-                  'so what', 'so how', "what's ", "how's "]
-    lower = s.lower()
-    for starter in q_starters:
-        if lower.startswith(starter) or lower.startswith('- ' + starter):
-            return "Q"
-    if '?' in s and len(s) < 200:
-        return "Q"
-    return "A"
+    if cur:
+        segments.append(cur)
 
-# ── 章节信息加载 ──────────────────────────────────────────
-def load_chapters(chapters_file):
+    # 去掉很短噪声段
+    segments = [s for s in segments if len(s) >= 20]
+
+    # 修复 bug: 去掉连续重复段
+    deduped = []
+    prev_norm = ""
+    for seg in segments:
+        n = normalize_for_dedup(seg)
+        if n and n == prev_norm:
+            continue
+        deduped.append(seg)
+        prev_norm = n
+
+    return deduped
+
+
+def load_chapters(chapters_file: str):
     if not chapters_file or not os.path.exists(chapters_file):
         return []
     try:
-        with open(chapters_file) as f:
+        with open(chapters_file, encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list):
-            return [(ch.get("start_time", 0), ch.get("title", "")) for ch in data if ch.get("title")]
-        return []
-    except (json.JSONDecodeError, IOError):
+        if not isinstance(data, list):
+            return []
+        out = []
+        for ch in data:
+            start = ch.get("start_time", 0)
+            title = (ch.get("title") or "").strip()
+            if title:
+                out.append((float(start), title))
+        return out
+    except Exception:
         return []
 
-def load_timed_data(timed_file):
+
+def load_timed_data(timed_file: str):
     if not timed_file or not os.path.exists(timed_file):
         return []
-    parts = []
-    with open(timed_file) as f:
+    result = []
+    with open(timed_file, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
-                try:
-                    d = json.loads(line)
-                    parts.append((d["t"], d["text"]))
-                except (json.JSONDecodeError, KeyError):
-                    pass
-    return parts
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+                t = float(d.get("t", 0))
+                txt = str(d.get("text", ""))
+                if txt:
+                    result.append((t, txt))
+            except Exception:
+                continue
+    return result
+
 
 def map_segments_to_chapters(segments, chapters, timed_data):
     if not chapters or not timed_data:
         return {}
 
-    total_segs = len(segments)
-    total_timed = len(timed_data)
+    seg_to_time = {}
+    timed_len = len(timed_data)
 
-    seg_times = {}
-    timed_idx = 0
-    for si, seg in enumerate(segments):
-        seg_words = seg[:60].lower().split()
-        estimated = max(timed_idx, int(si / total_segs * total_timed) - 5)
-        search_start = max(0, estimated - 10)
-        search_end = min(total_timed, estimated + 50)
+    for i, seg in enumerate(segments):
+        probe = normalize_for_dedup(seg[:120])
+        if not probe:
+            continue
+        est_idx = int((i / max(len(segments), 1)) * max(timed_len - 1, 0))
+        best_t = timed_data[est_idx][0]
 
-        best_t = None
-        for ti in range(search_start, search_end):
-            timed_text = timed_data[ti][1].lower()
-            if len(seg_words) >= 3:
-                match_str = " ".join(seg_words[:4])
-                if match_str in timed_text or timed_text[:30] in seg[:60].lower():
-                    best_t = timed_data[ti][0]
-                    timed_idx = ti
-                    break
-            elif timed_text[:25] in seg[:60].lower() and len(timed_text) > 5:
-                best_t = timed_data[ti][0]
-                timed_idx = ti
+        for j in range(max(0, est_idx - 20), min(timed_len, est_idx + 40)):
+            ttxt = normalize_for_dedup(timed_data[j][1])
+            if probe[:20] and probe[:20] in ttxt:
+                best_t = timed_data[j][0]
                 break
 
-        if best_t is None and total_timed > 0:
-            ratio = si / max(total_segs, 1)
-            est_idx = min(int(ratio * total_timed), total_timed - 1)
-            best_t = timed_data[est_idx][0]
-            timed_idx = est_idx
-
-        if best_t is not None:
-            seg_times[si] = best_t
+        seg_to_time[i] = best_t
 
     chapter_starts = sorted(chapters, key=lambda x: x[0])
     chapter_first_seg = {}
 
-    for si, t in sorted(seg_times.items()):
-        chapter_title = chapter_starts[0][1]
+    for i, ts in sorted(seg_to_time.items()):
+        current_title = chapter_starts[0][1]
         for cs, ct in chapter_starts:
-            if t >= cs:
-                chapter_title = ct
+            if ts >= cs:
+                current_title = ct
             else:
                 break
-        if chapter_title not in chapter_first_seg:
-            chapter_first_seg[chapter_title] = si
+        if current_title not in chapter_first_seg:
+            chapter_first_seg[current_title] = i
 
     return chapter_first_seg
 
-# ── 翻译 ──────────────────────────────────────────────────
-def translate_batch(segments, batch_size=10):
-    translations = []
+
+def translate_segments(segments, prompt_template: str):
+    translated = []
     total = len(segments)
-    for i in range(0, total, batch_size):
-        batch = segments[i:i+batch_size]
-        numbered = "\n".join(f"[{j+1}] {seg}" for j, seg in enumerate(batch))
-        prompt = f"""请将以下英文播客对话翻译成中文。保持原意，语言自然流畅。每段用 [编号] 开头，一一对应。只输出翻译。
 
-{numbered}"""
-        log(f"翻译 {i+1}-{min(i+batch_size, total)}/{total}")
-        result = ark_chat(prompt, model=TRANSLATE_MODEL, max_tokens=4096, temperature=0.2)
-        if not result:
-            translations.extend(["（翻译失败）"] * len(batch))
-            continue
-        parsed = {}
-        current_num = None
-        current_text = []
-        for line in result.strip().split("\n"):
-            m = re.match(r'\[(\d+)\]\s*(.*)', line)
-            if m:
-                if current_num is not None:
-                    parsed[current_num] = " ".join(current_text).strip()
-                current_num = int(m.group(1))
-                current_text = [m.group(2)]
-            elif current_num is not None:
-                current_text.append(line.strip())
-        if current_num is not None:
-            parsed[current_num] = " ".join(current_text).strip()
-        for j in range(len(batch)):
-            translations.append(parsed.get(j+1, "（翻译失败）"))
-        if i + batch_size < total:
-            time.sleep(1)
-    return translations
+    for idx, seg in enumerate(segments, 1):
+        prompt = (
+            f"{prompt_template}\n\n"
+            "[英文原文]\n"
+            f"{seg}\n\n"
+            "[输出要求]\n"
+            "只输出对应的中文翻译，不要解释。"
+        )
+        log(f"翻译段落 {idx}/{total}")
+        zh = ark_chat(prompt, model=TRANSLATE_MODEL, max_tokens=1800, temperature=0.2)
+        if not zh:
+            zh = "（翻译失败）"
+        translated.append(zh.strip())
+    return translated
 
-# ── 增强摘要 + 金句 ──────────────────────────────────────
-def generate_enhanced_summary(podcast_name, episode_title, transcript_text):
-    text_for_summary = transcript_text[:8000]
-    prompt = f"""你是一位资深产品经理和科技行业分析师。请根据以下播客转录内容，生成深度结构化摘要。
 
-播客：{podcast_name}
-标题：{episode_title}
+def parse_first_json(text: str):
+    text = text.strip()
+    if not text:
+        return None
 
-转录内容：
-{text_for_summary}
+    # 优先直接解析
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
 
-请严格按以下格式输出（中文）：
+    # 回退：提取首个 JSON 对象
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
 
-## 推荐等级
-根据内容与产品经理/科技从业者的相关度，只输出 P0、P1 或 P2 之一：
-- P0 特别推荐：AI/大模型/产品策略/创业/技术趋势高度相关，嘉宾是行业重量级人物，内容对产品经理有直接可操作启发
-- P1 一般推荐：科技/商业/技术话题，有一定参考价值但不是核心关注领域
-- P2 空闲再看：娱乐/体育/生活话题，与产品经理工作关联度低
 
-## 核心摘要
-用3-5段话总结本期核心内容，包含主要话题、嘉宾关键论点、重要数据或案例。
+def fallback_summary(segments):
+    excerpt = " ".join(segments[:3])[:280]
+    return {
+        "one_liner": "这期对话围绕技术趋势与实践展开，值得快速浏览关键观点。",
+        "key_points": [
+            "讨论了技术演进与落地路径",
+            "包含可执行的方法或判断",
+            "对产品与工程协作有参考价值",
+        ],
+        "golden_quotes": [],
+        "pm_insights": ["建议结合自身业务场景验证，而非直接照搬。"],
+        "tools_mentioned": [],
+        "recommendation": "P1",
+        "summary_zh": excerpt if excerpt else "摘要生成失败，建议查看原文。",
+    }
 
-## 核心观点
-· 观点1（一句话概括）
-· 观点2
-· 观点3
-· 观点4（如有）
-· 观点5（如有）
 
-## 精彩金句
-从原文中挑选3-5句最有洞察力、最值得记住的金句，保留英文原文并附中文翻译：
-1. "English quote here" — 中文翻译
-2. "English quote here" — 中文翻译
-3. "English quote here" — 中文翻译
+def normalize_summary(data):
+    if not isinstance(data, dict):
+        return fallback_summary([])
 
-## 产品经理 Insight
-从产品经理视角提炼可操作洞察（3-5条，每条1-2句话，要具体可落地）：
-· 产品设计/策略启发
-· 增长/获客方法论
-· 组织管理/团队协作
-· 技术趋势对产品的影响
-· 用户需求洞察
+    rec = str(data.get("recommendation", "P1")).upper().strip()
+    if rec not in {"P0", "P1", "P2"}:
+        rec = "P1"
 
-## 推荐工具/方法
-列出播客中提到的工具、框架或方法（没有则写"无"）
+    def ensure_list(key, limit, default=None):
+        value = data.get(key, default if default is not None else [])
+        if isinstance(value, str):
+            value = [value] if value.strip() else []
+        if not isinstance(value, list):
+            value = []
+        out = [str(x).strip() for x in value if str(x).strip()]
+        return out[:limit]
 
-只输出上述内容。"""
+    one_liner = str(data.get("one_liner", "")).strip()
+    summary_zh = str(data.get("summary_zh", "")).strip()
 
-    log("生成增强摘要+金句+打标...")
-    result = ark_chat(prompt, model=SUMMARY_MODEL, max_tokens=3000, temperature=0.3) or "（摘要生成失败）"
+    key_points = ensure_list("key_points", 5, default=[])
+    if len(key_points) < 3:
+        key_points = (key_points + ["观点待补充"] * 3)[:3]
 
-    level = None
-    for line in result.split("\n"):
-        stripped = line.strip()
-        if stripped in ("P0", "P1", "P2"):
-            level = stripped
-            break
-        for lv in ["P0", "P1", "P2"]:
-            if stripped.startswith(lv) or stripped == lv:
-                level = lv
-                break
-        if level:
-            break
+    golden_quotes = ensure_list("golden_quotes", 3, default=[])
+    pm_insights = ensure_list("pm_insights", 5, default=[])
+    if not pm_insights:
+        pm_insights = ["建议结合团队现状做小规模验证，再扩大投入。"]
 
-    if not level:
-        level = recommend_by_keywords(podcast_name, episode_title)
-        log(f"摘要中未提取到等级，fallback 关键词: {level}")
-    else:
-        log(f"AI 推荐等级: {level}")
+    tools = ensure_list("tools_mentioned", 8, default=[])
 
-    return result, level
+    return {
+        "one_liner": one_liner,
+        "key_points": key_points,
+        "golden_quotes": golden_quotes,
+        "pm_insights": pm_insights,
+        "tools_mentioned": tools,
+        "recommendation": rec,
+        "summary_zh": summary_zh,
+    }
 
-# ── 推荐等级打标 ─────────────────────────────────────────
-RECOMMEND_MODE = os.environ.get("RECOMMEND_MODE", "ai")
 
-def recommend_by_keywords(podcast_name, episode_title):
-    p0_podcasts = {"No Priors", "Latent Space", "Lenny's Podcast", "Dwarkesh Podcast"}
-    p0_keywords = ["ai", "product", "startup", "agent", "llm", "founder", "ceo",
-                   "notion", "anthropic", "openai", "google", "meta", "apple",
-                   "infrastructure", "scaling", "reasoning", "model"]
-    title_lower = episode_title.lower()
-    if podcast_name in p0_podcasts:
-        return "P0"
-    for kw in p0_keywords:
-        if kw in title_lower:
-            return "P0"
-    p1_podcasts = {"Lex Fridman Podcast", "Hard Fork (NYT)", "TWIML AI Podcast",
-                   "All-In Podcast", "The Knowledge Project"}
-    if podcast_name in p1_podcasts:
-        return "P1"
-    return "P2"
+def generate_summary(podcast_name: str, episode_title: str, transcript_text: str, prompt_template: str):
+    prompt = (
+        f"{prompt_template}\n\n"
+        f"播客：{podcast_name}\n"
+        f"标题：{episode_title}\n\n"
+        "转录（可能截断）：\n"
+        f"{transcript_text[:12000]}\n"
+    )
+    log("生成结构化摘要")
+    raw = ark_chat(prompt, model=SUMMARY_MODEL, max_tokens=2200, temperature=0.3)
+    parsed = parse_first_json(raw)
+    if parsed is None:
+        log("摘要 JSON 解析失败，使用兜底摘要")
+        return fallback_summary(split_into_segments(transcript_text, max_chars=1000)[:5])
+    return normalize_summary(parsed)
 
-def recommend_by_ai(podcast_name, episode_title, summary_text):
-    summary_excerpt = summary_text[:2000] if summary_text else ""
-    prompt = f"""你是一位科技行业产品经理的播客推荐助手。请根据以下播客信息判断推荐等级。
 
-播客：{podcast_name}
-标题：{episode_title}
-摘要：{summary_excerpt}
+def build_markdown(
+    output_path: str,
+    podcast_name: str,
+    episode_title: str,
+    date_str: str,
+    duration: str,
+    recommendation: str,
+    summary: dict,
+    segments,
+    chapter_first_seg,
+    episode_link: str,
+):
+    lines = []
+    lines.append(f"# {podcast_name} {episode_title}")
 
-推荐等级标准：
-- P0 特别推荐：与 AI/大模型/产品策略/创业/技术趋势高度相关，嘉宾是行业重量级人物
-- P1 一般推荐：科技/商业/技术话题，有一定参考价值但不是核心关注领域
-- P2 空闲再看：娱乐/体育/非科技话题，或与产品经理工作关联度低
+    meta = [date_str, f"{recommendation} 推荐"]
+    if duration:
+        meta.append(duration)
+    lines.append(f"> {' | '.join(meta)}")
+    if episode_link:
+        lines.append(f"> 原链接: {episode_link}")
+    lines.append("")
 
-请只输出一个词：P0 或 P1 或 P2"""
+    lines.append("## 摘要")
+    if summary.get("summary_zh"):
+        lines.append(summary["summary_zh"])
+    if summary.get("one_liner"):
+        lines.append("")
+        lines.append(f"- 一句话结论：{summary['one_liner']}")
+    if summary.get("key_points"):
+        lines.append("- 核心观点：")
+        for p in summary["key_points"]:
+            lines.append(f"  - {p}")
+    if summary.get("golden_quotes"):
+        lines.append("- 金句：")
+        for q in summary["golden_quotes"]:
+            lines.append(f"  - {q}")
+    if summary.get("pm_insights"):
+        lines.append("- PM 洞察：")
+        for insight in summary["pm_insights"]:
+            lines.append(f"  - {insight}")
 
-    log("AI 推荐等级打标...")
-    result = ark_chat(prompt, model=TRANSLATE_MODEL, max_tokens=10, temperature=0.1)
-    if result:
-        result = result.strip().upper()
-        for level in ["P0", "P1", "P2"]:
-            if level in result:
-                log(f"AI 打标结果: {level}")
-                return level
-    log("AI 打标失败，fallback 到关键词")
-    return None
+    chapter_by_index = {idx: title for title, idx in chapter_first_seg.items()}
 
-def get_recommend_level(podcast_name, episode_title, summary_text=""):
-    if RECOMMEND_MODE == "ai":
-        ai_result = recommend_by_ai(podcast_name, episode_title, summary_text)
-        if ai_result:
-            return ai_result
-    return recommend_by_keywords(podcast_name, episode_title)
+    for i, seg in enumerate(segments):
+        if i in chapter_by_index:
+            lines.append("")
+            lines.append(f"## {chapter_by_index[i]}")
+            lines.append("")
 
-# ── 从摘要中提取金句用于高亮 ─────────────────────────────
-def extract_quotes_for_highlight(summary, segments):
-    highlight_indices = set()
-    quotes = re.findall(r'"([^"]{20,})"', summary)
-    if not quotes:
-        quotes = re.findall(r'\u201c([^\u201d]{20,})\u201d', summary)
+        lines.append(seg["en"])
+        lines.append("")
+        lines.append(seg["zh"])
+        lines.append("")
 
-    for quote in quotes:
-        quote_lower = quote.lower()[:60]
-        for i, seg in enumerate(segments):
-            if quote_lower in seg.lower():
-                highlight_indices.add(i)
-                break
-    return highlight_indices
+    lines.append("---")
+    lines.append("Generated by podcast-daily-skill")
 
-# ── 主流程 ────────────────────────────────────────────────
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines).strip() + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("transcript_file")
@@ -355,91 +428,91 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--chapters", default="")
     parser.add_argument("--timed", default="")
+    parser.add_argument("--markdown-out", default="")
+    parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
+    parser.add_argument("--duration", default="")
+    parser.add_argument("--episode-link", default="")
     args = parser.parse_args()
+
+    ensure_env()
 
     if not os.path.exists(args.transcript_file):
         log(f"文件不存在: {args.transcript_file}")
         sys.exit(1)
 
-    # 0. 缓存去重
-    if os.path.exists(args.out):
-        try:
-            with open(args.out, encoding="utf-8") as f:
-                existing = json.load(f)
-            if existing.get("episode_title") == html.unescape(args.episode_title) and existing.get("segments"):
-                log(f"缓存命中，跳过处理: {args.out} ({len(existing['segments'])} 段)")
-                return
-        except (json.JSONDecodeError, KeyError, IOError):
-            pass
-
-    # 1. 读取并清洗
     with open(args.transcript_file, encoding="utf-8", errors="replace") as f:
         raw_text = f.read()
-    text = clean_text(raw_text)
-    log(f"原文长度: {len(text)} 字符")
 
-    # 2. 加载章节和时间戳数据
+    cleaned = clean_text(raw_text)
+    segments_en = split_into_segments(cleaned, max_chars=1200)
+
+    if not segments_en:
+        log("分段后为空，退出")
+        sys.exit(1)
+
+    log(f"原文长度: {len(cleaned)} 字符")
+    log(f"段落数: {len(segments_en)}")
+
+    translate_prompt = load_prompt("translate-bilingual.md", DEFAULT_TRANSLATE_PROMPT)
+    summary_prompt = load_prompt("summarize-podcast.md", DEFAULT_SUMMARY_PROMPT)
+
+    segments_zh = translate_segments(segments_en, translate_prompt)
+    summary = generate_summary(args.podcast_name, args.episode_title, cleaned, summary_prompt)
+
     chapters = load_chapters(args.chapters)
     timed_data = load_timed_data(args.timed)
-    if chapters:
-        log(f"加载 {len(chapters)} 个章节")
+    chapter_first_seg = map_segments_to_chapters(segments_en, chapters, timed_data)
 
-    # 3. 分段
-    segments = split_into_segments(text, max_chars=500)
-    log(f"分成 {len(segments)} 段")
+    segment_items = []
+    for en, zh in zip(segments_en, segments_zh):
+        segment_items.append({"en": en, "zh": zh})
 
-    # 4. Q/A 类型检测
-    qa_types = [detect_qa_type(seg) for seg in segments]
+    estimated_duration_seconds = int(max((t for t, _ in timed_data), default=0))
 
-    # 5. 章节映射
-    chapter_first_seg = map_segments_to_chapters(segments, chapters, timed_data)
-
-    # 6. 翻译
-    log("开始翻译...")
-    translations = translate_batch(segments)
-
-    # 7. 增强摘要 + 金句 + 推荐等级
-    summary, recommend_level = generate_enhanced_summary(args.podcast_name, args.episode_title, text)
-
-    # 8. 高亮标记
-    highlight_indices = extract_quotes_for_highlight(summary, segments)
-    if highlight_indices:
-        log(f"标记 {len(highlight_indices)} 段高亮")
-
-    # 9. 组装 segments
-    result_segments = []
-    for i, (en, zh, qtype) in enumerate(zip(segments, translations, qa_types)):
-        seg_data = {
-            "en": en,
-            "zh": zh,
-            "type": qtype,
-        }
-        if i in highlight_indices:
-            seg_data["highlight"] = True
-        result_segments.append(seg_data)
-
-    # 10. 输出
-    output = {
+    out = {
         "podcast_name": args.podcast_name,
         "episode_title": html.unescape(args.episode_title),
-        "recommend_level": recommend_level,
-        "summary": summary,
-        "chapters": [{"start": s, "title": t} for s, t in chapters] if chapters else [],
+        "recommendation": summary.get("recommendation", "P1"),
+        "summary": {
+            "one_liner": summary.get("one_liner", ""),
+            "key_points": summary.get("key_points", []),
+            "golden_quotes": summary.get("golden_quotes", []),
+            "pm_insights": summary.get("pm_insights", []),
+            "tools_mentioned": summary.get("tools_mentioned", []),
+            "summary_zh": summary.get("summary_zh", ""),
+        },
+        "chapters": [{"start": s, "title": t} for s, t in chapters],
         "chapter_segments": {str(v): k for k, v in chapter_first_seg.items()},
-        "segments": result_segments,
+        "segments": segment_items,
         "meta": {
-            "total_chars": len(text),
-            "total_segments": len(result_segments),
-            "highlight_count": len(highlight_indices),
+            "raw_length": len(cleaned),
+            "total_segments": len(segment_items),
             "chapter_count": len(chapters),
-            "processed_at": time.strftime("%Y-%m-%d %H:%M:%S")
-        }
+            "estimated_duration_seconds": estimated_duration_seconds,
+            "processed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
     }
 
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
+        json.dump(out, f, ensure_ascii=False, indent=2)
 
-    log(f"处理完成: {args.out} ({len(result_segments)} 段, {len(highlight_indices)} 高亮, {len(chapters)} 章节)")
+    if args.markdown_out:
+        build_markdown(
+            output_path=args.markdown_out,
+            podcast_name=args.podcast_name,
+            episode_title=html.unescape(args.episode_title),
+            date_str=args.date,
+            duration=args.duration,
+            recommendation=out["recommendation"],
+            summary=out["summary"],
+            segments=segment_items,
+            chapter_first_seg=chapter_first_seg,
+            episode_link=args.episode_link,
+        )
+
+    log(f"处理完成: {args.out}")
+
 
 if __name__ == "__main__":
     main()
