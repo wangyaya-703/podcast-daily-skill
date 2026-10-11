@@ -1,4 +1,10 @@
 {
-  "processedEpisodes": {},
-  "lastRunAt": "2026-10-10T14:55:25Z"
+  "processedEpisodes": {
+    "JoeRogan_23db6084": {
+      "title": "#2563 - Dan Richards",
+      "processedAt": "2026-10-11T15:12:08Z",
+      "titleHash": "23db6084"
+    }
+  },
+  "lastRunAt": "2026-10-11T15:12:08Z"
 }
