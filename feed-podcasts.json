@@ -1,43 +1,12 @@
 {
-  "generatedAt": "2026-10-11T15:12:08Z",
-  "date": "2026-10-11",
-  "episodes": [
-    {
-      "id": "JoeRogan_23db6084",
-      "key": "JoeRogan",
-      "name": "The Joe Rogan Experience",
-      "title": "#2563 - Dan Richards",
-      "link": "",
-      "audioUrl": "https://traffic.megaphone.fm/GLT1048281357.mp3",
-      "duration": "2h 48min",
-      "publishedAt": "2026-10-08T17:00:00Z",
-      "recommendation": "P1",
-      "summary": {
-        "one_liner": "这期对话围绕技术趋势与实践展开，值得快速浏览关键观点。",
-        "key_points": [
-          "讨论了技术演进与落地路径",
-          "包含可执行的方法或判断",
-          "对产品与工程协作有参考价值"
-        ],
-        "golden_quotes": [],
-        "pm_insights": [
-          "建议结合自身业务场景验证，而非直接照搬。"
-        ],
-        "tools_mentioned": []
-      },
-      "transcript": {
-        "bilingualUrl": "transcripts/2026-10-11/JoeRogan.md",
-        "rawLength": 181890,
-        "segments": 161,
-        "chapters": 0
-      }
-    }
-  ],
+  "generatedAt": "2026-10-12T18:23:14Z",
+  "date": "2026-10-12",
+  "episodes": [],
   "stats": {
-    "totalEpisodes": 1,
+    "totalEpisodes": 0,
     "byRecommendation": {
       "P0": 0,
-      "P1": 1,
+      "P1": 0,
       "P2": 0
     }
   }
